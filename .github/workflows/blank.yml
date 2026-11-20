@@ -23,6 +23,6 @@ jobs:
         run: |
           git config user.name "digest-bot"
           git config user.email "digest-bot@users.noreply.github.com"
-          git add docs/index.html
+          git add docs/index.html state.json
           git diff --cached --quiet || git commit -m "Update digest"
           git push
