@@ -2,16 +2,20 @@ name: Update digest
 
 on:
   schedule:
-    - cron: "0 23 * * *"   # 7:00 AM Manila
-    - cron: "0 7 * * *"    # 3:00 PM Manila
+    - cron: "*/30 * * * *"   # every 30 minutes, around the clock
   workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: nexus-digest
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -25,4 +29,5 @@ jobs:
           git config user.email "digest-bot@users.noreply.github.com"
           git add docs/index.html state.json
           git diff --cached --quiet || git commit -m "Update digest"
+          git pull --rebase origin main
           git push
