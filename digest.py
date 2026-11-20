@@ -1,5 +1,6 @@
 import feedparser
 import html
+import json
 import os
 import re
 from datetime import datetime, timezone
@@ -8,17 +9,15 @@ from urllib.parse import quote
 
 MANILA = ZoneInfo("Asia/Manila")
 
-PAGE_TITLE = "GIA News Tracker Agent V1"
-HEADING = "GIA Automated News Tracker"
-VERSION = "v1.0"
-SUBTITLE = "Updates every 7:00 AM and 3:00 PM Manila time"
+PAGE_TITLE = "NEXUS by GIA"
+STATE_FILE = "state.json"   # remembers the last story seen per topic
 
 # ---------------------------------------------------------------
 # SETTINGS
 # ---------------------------------------------------------------
 LOCAL_ONLY = True        # True = search only Philippine news sites
 STRICT_FILTER = True     # True = drop headlines that don't match the topic rules
-MAX_PER_SECTION = 10     # newest items shown per topic
+MAX_PER_SECTION = 10     # newest items kept per topic
 BLOCKED_SOURCES = []     # e.g. ["Facebook"] to hide a source
 
 LOCAL_SITES = [
@@ -43,6 +42,7 @@ POLICY = (
 
 # ---------------------------------------------------------------
 # TOPICS
+#   tier    : "core" or "energy" (controls grouping in the filter bar)
 #   queries : what we ask Google News
 #   window  : how far back to look (days)
 #   require : every pattern here must appear in the headline
@@ -50,7 +50,7 @@ POLICY = (
 # ---------------------------------------------------------------
 TOPICS = [
     {
-        "name": "CARS",
+        "name": "CARS", "tier": "core",
         "full": "Comprehensive Automotive Resurgence Strategy",
         "window": "30d",
         "queries": [
@@ -66,7 +66,7 @@ TOPICS = [
         "exclude": [],
     },
     {
-        "name": "EVIS",
+        "name": "EVIS", "tier": "core",
         "full": "Electric Vehicle Incentive Strategy",
         "window": "30d",
         "queries": [
@@ -85,7 +85,7 @@ TOPICS = [
         ],
     },
     {
-        "name": "RACE",
+        "name": "RACE", "tier": "core",
         "full": "Revitalizing the Automotive Industry for Competitiveness Enhancement",
         "window": "30d",
         "queries": [
@@ -104,7 +104,7 @@ TOPICS = [
         ],
     },
     {
-        "name": "Automotive tariffs and taxes",
+        "name": "Tariffs and taxes", "tier": "core",
         "full": "Vehicle tariffs, excise taxes, JPEPA, ASEAN and other trade agreements",
         "window": "14d",
         "queries": [
@@ -120,7 +120,7 @@ TOPICS = [
         "exclude": [r"canada|thailand|\buk\b|britain"],
     },
     {
-        "name": "Hydrogen",
+        "name": "Hydrogen", "tier": "energy",
         "full": "Hydrogen and clean fuels in the Philippines",
         "window": "7d",
         "queries": [
@@ -131,7 +131,7 @@ TOPICS = [
         "exclude": [],
     },
     {
-        "name": "Biofuels",
+        "name": "Biofuels", "tier": "energy",
         "full": "Biodiesel, bioethanol and blending mandates",
         "window": "7d",
         "queries": [
@@ -146,7 +146,7 @@ TOPICS = [
         "exclude": [],
     },
     {
-        "name": "Carbon trading",
+        "name": "Carbon trading", "tier": "energy",
         "full": "Carbon markets, credits and carbon pricing",
         "window": "7d",
         "queries": [
@@ -191,12 +191,12 @@ def parse_entry(e):
     text = title.lower()
     if len(title) > 150:
         title = title[:147].rstrip() + "..."
-    dt = None
+    ts = None
     if e.get("published_parsed"):
-        dt = datetime(*e["published_parsed"][:6], tzinfo=timezone.utc).astimezone(MANILA)
+        ts = int(datetime(*e["published_parsed"][:6], tzinfo=timezone.utc).timestamp() * 1000)
     return {
         "title": title, "text": text, "source": source,
-        "href": href, "link": e.get("link", ""), "dt": dt,
+        "href": href, "link": e.get("link", ""), "ts": ts,
     }
 
 
@@ -215,13 +215,18 @@ def is_relevant(item, topic):
     return all(re.search(p, text) for p in topic["require"])
 
 
-def slugify(text):
-    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+def load_state():
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
 
 now = datetime.now(MANILA)
-nav, sections = [], []
-total = 0
+state = load_state()
+all_items, topic_meta = [], []
 
 for topic in TOPICS:
     items, seen_links, seen_titles = [], set(), set()
@@ -240,126 +245,334 @@ for topic in TOPICS:
             seen_titles.add(item["text"])
             items.append(item)
 
-    items.sort(key=lambda i: i["dt"] or datetime.min.replace(tzinfo=MANILA), reverse=True)
+    items.sort(key=lambda i: i["ts"] or 0, reverse=True)
     items = items[:MAX_PER_SECTION]
-    total += len(items)
 
-    cards = []
+    if items and items[0]["ts"]:
+        state[topic["name"]] = {"ts": items[0]["ts"], "title": items[0]["title"]}
+
     for i in items:
-        meta = []
-        if i["source"]:
-            meta.append(f'<span class="src">{html.escape(i["source"])}</span>')
-        if i["dt"]:
-            meta.append(f'<span>{i["dt"]:%b %d, %Y &middot; %I:%M %p}</span>')
-            if (now - i["dt"]).total_seconds() < 86400:
-                meta.append('<span class="new">New</span>')
-        cards.append(
-            '<li class="card">'
-            f'<a href="{html.escape(i["link"])}" target="_blank" rel="noopener">'
-            f'{html.escape(i["title"])}</a>'
-            f'<div class="meta">{"".join(meta)}</div></li>'
-        )
-    if not cards:
-        days = topic["window"].rstrip("d")
-        cards = [f'<li class="empty">No matching local news in the last {days} days.</li>']
+        all_items.append({
+            "topic": topic["name"], "title": i["title"], "source": i["source"],
+            "link": i["link"], "ts": i["ts"],
+        })
+    topic_meta.append({
+        "name": topic["name"], "full": topic["full"], "tier": topic["tier"],
+        "window": int(topic["window"].rstrip("d")),
+        "last": state.get(topic["name"]),
+    })
 
-    slug = slugify(topic["name"])
-    nav.append(f'<a href="#{slug}">{html.escape(topic["name"])} <span>{len(items)}</span></a>')
-    sections.append(
-        f'<section id="{slug}"><h2>{html.escape(topic["name"])}'
-        f'<span class="count">{len(items)}</span></h2>'
-        f'<p class="desc">{html.escape(topic["full"])}</p>'
-        f'<ul>{"".join(cards)}</ul></section>'
-    )
+with open(STATE_FILE, "w", encoding="utf-8") as f:
+    json.dump(state, f, ensure_ascii=False, indent=2)
 
-TEMPLATE = """<!doctype html>
+data = {
+    "built": int(now.timestamp() * 1000),
+    "topics": topic_meta,
+    "items": all_items,
+}
+data_json = json.dumps(data, ensure_ascii=False).replace("<", "\\u003c")
+
+TEMPLATE = r"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="description" content="Automated policy and industry news monitoring.">
-<title>__PAGE_TITLE__</title>
+<meta name="description" content="NEXUS by GIA: Government and Industry Affairs news monitoring.">
+<title>__TITLE__</title>
 <style>
   :root {
-    --bg: #f4f6f9; --card: #ffffff; --text: #1b2430; --muted: #667085;
-    --line: #e4e7ec; --brand: #0b3d91; --brand-soft: #e8eefb; --new: #067647; --new-bg: #dcfae6;
+    --bg:#f5f5f5; --card:#ffffff; --tx:#0b0b0b; --mu:#5f5f5f; --ln:#e3e3e3;
+    --rd:#eb0a1e; --rdt:#c8081a; --tagbg:#0b0b0b; --tagtx:#ffffff;
+    --warnbg:#fff0c2; --warntx:#6b4300; --warnln:#f0d58a;
   }
   @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #0f141b; --card: #171e28; --text: #e8edf4; --muted: #9aa5b4;
-      --line: #263041; --brand: #7aa2f7; --brand-soft: #1d2a44; --new: #75e0a7; --new-bg: #0f3a28;
+    :root:not([data-theme="light"]) {
+      --bg:#121212; --card:#1b1b1b; --tx:#f5f5f5; --mu:#a0a0a0; --ln:#2c2c2c;
+      --rdt:#ff5a67; --tagbg:#ffffff; --tagtx:#0b0b0b;
+      --warnbg:#3a2a00; --warntx:#ffd48a; --warnln:#5a4200;
     }
   }
+  :root[data-theme="dark"] {
+    --bg:#121212; --card:#1b1b1b; --tx:#f5f5f5; --mu:#a0a0a0; --ln:#2c2c2c;
+    --rdt:#ff5a67; --tagbg:#ffffff; --tagtx:#0b0b0b;
+    --warnbg:#3a2a00; --warntx:#ffd48a; --warnln:#5a4200;
+  }
   * { box-sizing: border-box; }
-  body { margin: 0; background: var(--bg); color: var(--text);
-         font-family: "Segoe UI", system-ui, -apple-system, Roboto, sans-serif; line-height: 1.5; }
-  header { background: var(--brand); color: #fff; padding: 2rem 1rem 2.5rem; }
-  @media (prefers-color-scheme: dark) { header { background: #14233f; } }
-  .wrap { max-width: 880px; margin: 0 auto; padding: 0 1rem; }
-  header .wrap { padding: 0; }
-  h1 { margin: 0; font-size: 1.7rem; letter-spacing: -.01em; }
-  .badge { font-size: .7rem; font-weight: 600; background: rgba(255,255,255,.2);
-           padding: .15rem .55rem; border-radius: 999px; margin-left: .5rem; vertical-align: middle; }
-  .sub { margin: .4rem 0 0; opacity: .9; }
-  .stamp { margin: .9rem 0 0; font-size: .85rem; opacity: .8; }
-  .tools { margin-top: -1.3rem; }
-  .search { width: 100%; padding: .85rem 1rem; font-size: 1rem; border: 1px solid var(--line);
-            border-radius: 10px; background: var(--card); color: var(--text);
-            box-shadow: 0 2px 8px rgba(16,24,40,.08); }
-  .chips { display: flex; flex-wrap: wrap; gap: .5rem; margin: 1rem 0 .5rem; }
-  .chips a { text-decoration: none; font-size: .85rem; color: var(--brand); background: var(--brand-soft);
-             padding: .35rem .75rem; border-radius: 999px; font-weight: 500; }
-  .chips a span { opacity: .7; margin-left: .25rem; }
-  section { margin-top: 1.75rem; scroll-margin-top: 1rem; }
-  h2 { font-size: 1.1rem; margin: 0; display: flex; align-items: center; gap: .5rem; }
-  .desc { margin: .15rem 0 .6rem; font-size: .85rem; color: var(--muted); }
-  .count { font-size: .75rem; font-weight: 600; color: var(--muted); background: var(--card);
-           border: 1px solid var(--line); border-radius: 999px; padding: .05rem .5rem; }
-  ul { list-style: none; margin: 0; padding: 0; display: grid; gap: .6rem; }
-  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: .8rem 1rem; }
-  .card:hover { border-color: var(--brand); }
-  .card a { color: var(--text); text-decoration: none; font-weight: 600; }
-  .card a:hover { color: var(--brand); text-decoration: underline; }
-  .meta { display: flex; flex-wrap: wrap; align-items: center; gap: .6rem; margin-top: .3rem;
-          font-size: .8rem; color: var(--muted); }
-  .src { font-weight: 600; color: var(--brand); }
-  .new { color: var(--new); background: var(--new-bg); font-weight: 600; font-size: .7rem;
-         padding: .05rem .45rem; border-radius: 999px; }
-  .empty { color: var(--muted); font-style: italic; padding: .4rem 0; }
-  footer { margin: 2.5rem 0 2rem; font-size: .8rem; color: var(--muted); text-align: center; }
-  @media (max-width: 600px) { h1 { font-size: 1.4rem; } }
+  body { margin:0; background:var(--bg); color:var(--tx); line-height:1.5;
+         font-family:"Segoe UI", system-ui, -apple-system, Roboto, sans-serif; }
+  .wrap { max-width:920px; margin:0 auto; padding:0 1rem; }
+  button { font:inherit; cursor:pointer; }
+  :focus-visible { outline:2px solid var(--rd); outline-offset:2px; }
+
+  .top { background:#0b0b0b; border-top:4px solid var(--rd); color:#fff; padding:1rem 0; }
+  .hd { display:flex; align-items:center; justify-content:space-between; gap:.75rem; flex-wrap:wrap; }
+  .brand { display:flex; align-items:center; gap:.75rem; }
+  .mark { width:38px; height:38px; border-radius:50%; background:var(--rd); color:#fff;
+          display:flex; align-items:center; justify-content:center; font-weight:600; font-size:1.1rem; }
+  h1 { margin:0; font-size:1.35rem; letter-spacing:.12em; font-weight:600; line-height:1.1; }
+  h1 .by { letter-spacing:.02em; font-weight:400; font-size:.9rem; color:#cfcfcf; margin-left:.35rem; }
+  .brand p { margin:.15rem 0 0; font-size:.8rem; color:#bdbdbd; }
+  .hr { display:flex; align-items:center; gap:.6rem; font-size:.8rem; color:#cfcfcf; flex-wrap:wrap; }
+  .dot { width:8px; height:8px; border-radius:50%; background:var(--rd); display:inline-block; margin-right:.4rem; }
+  .ghost { background:transparent; border:1px solid #666; color:#fff; border-radius:999px;
+           padding:.4rem .9rem; min-height:36px; font-size:.8rem; }
+  .ghost:hover { border-color:#fff; }
+
+  .stale { background:var(--warnbg); color:var(--warntx); border-bottom:1px solid var(--warnln);
+           padding:.65rem 0; font-size:.9rem; }
+  .stale[hidden] { display:none; }
+
+  .stats { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:1px;
+           background:var(--ln); border-bottom:1px solid var(--ln); }
+  .st { background:var(--card); padding:.8rem 1rem; }
+  .st small { display:block; font-size:.78rem; color:var(--mu); }
+  .st b { font-size:1.4rem; font-weight:500; }
+  .st b.red { color:var(--rdt); }
+  .st b.sm { font-size:1.1rem; }
+
+  main { padding-top:1.1rem; padding-bottom:1rem; }
+  h2.sec { font-size:.85rem; font-weight:500; margin:0 0 .5rem; color:var(--mu); }
+  .nwg { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:.6rem; margin-bottom:1.1rem; }
+  .nc { display:block; text-decoration:none; color:var(--tx); background:var(--card);
+        border:1px solid var(--ln); border-top:3px solid var(--rd); padding:.6rem .75rem; }
+  .nc:hover { border-color:var(--tx); border-top-color:var(--rd); }
+  .nc span { font-size:.75rem; color:var(--rdt); font-weight:600; }
+  .nc p { margin:.15rem 0 0; font-size:.88rem; line-height:1.4; font-weight:500; }
+  .muted { color:var(--mu); font-size:.9rem; margin:0 0 1rem; }
+
+  .sticky { position:sticky; top:0; z-index:5; background:var(--bg); padding:.5rem 0 .1rem; }
+  .bar { display:flex; gap:.5rem; margin-bottom:.5rem; }
+  .q { flex:1; min-width:0; padding:.65rem .9rem; font:inherit; background:var(--card); color:var(--tx);
+       border:1px solid var(--ln); border-radius:8px; }
+  .cp { background:var(--tx); color:var(--bg); border:0; border-radius:8px; padding:0 1rem; min-height:44px; white-space:nowrap; }
+  .cp:hover { background:var(--rd); color:#fff; }
+  .chips { display:flex; gap:.4rem; overflow-x:auto; padding-bottom:.5rem; align-items:center; scrollbar-width:thin; }
+  .chip { flex:none; font-size:.82rem; padding:.4rem .85rem; min-height:36px; border-radius:999px;
+          border:1px solid var(--ln); background:var(--card); color:var(--tx); white-space:nowrap; }
+  .chip:hover { border-color:var(--tx); }
+  .chip.on { background:var(--rd); border-color:var(--rd); color:#fff; }
+  .chip i { font-style:normal; opacity:.7; margin-left:.3rem; }
+  .sep { flex:none; width:1px; height:18px; background:var(--ln); margin:0 .15rem; }
+
+  .dh { display:flex; align-items:center; gap:.6rem; font-size:.8rem; font-weight:500; color:var(--mu); margin:1rem 0 .5rem; }
+  .dh:after { content:""; flex:1; height:1px; background:var(--ln); }
+  .cd { background:var(--card); border:1px solid var(--ln); border-left:3px solid var(--rd);
+        padding:.65rem .9rem; margin-bottom:.5rem; transition:transform .12s; }
+  .cd:hover { transform:translateX(3px); border-color:var(--tx); border-left-color:var(--rd); }
+  .row { display:flex; align-items:center; gap:.5rem; }
+  .tag { font-size:.7rem; background:var(--tagbg); color:var(--tagtx); padding:.05rem .6rem; border-radius:999px; }
+  .nw { font-size:.7rem; background:var(--rd); color:#fff; padding:.05rem .6rem; border-radius:999px; font-weight:600; }
+  .ttl { display:block; margin-top:.3rem; font-size:.95rem; font-weight:600; line-height:1.45; color:var(--tx); text-decoration:none; }
+  .ttl:hover { color:var(--rdt); text-decoration:underline; }
+  .mt { margin-top:.25rem; font-size:.8rem; color:var(--mu); }
+  .mt b { font-weight:600; color:var(--tx); }
+  .qt { display:flex; align-items:center; gap:.6rem; flex-wrap:wrap; padding:.55rem .75rem; margin-bottom:.5rem;
+        border:1px dashed var(--ln); color:var(--mu); font-size:.85rem; }
+  .qt .tag { background:var(--ln); color:var(--tx); }
+  .none { text-align:center; color:var(--mu); padding:1.2rem 0; }
+  .none[hidden] { display:none; }
+  footer { background:#0b0b0b; color:#b5b5b5; font-size:.8rem; text-align:center; padding:1rem 0; margin-top:1.5rem; }
+  @media (max-width:600px) { .stats { grid-template-columns:1fr 1fr 1fr; } .st { padding:.6rem .6rem; } .st b { font-size:1.15rem; } }
+  @media (prefers-reduced-motion: reduce) { .cd { transition:none; } .cd:hover { transform:none; } }
+  @media print {
+    .ghost, .sticky, .cp, .stale, .stats { display:none !important; }
+    body { background:#fff; color:#000; } .top, footer { background:#fff; color:#000; border-color:#000; }
+    h1 .by, .brand p { color:#333; } .cd { break-inside:avoid; }
+  }
 </style></head>
 <body>
-<header><div class="wrap">
-  <h1>__HEADING__<span class="badge">__VERSION__</span></h1>
-  <p class="sub">__SUBTITLE__</p>
-  <p class="stamp">Last updated __UPDATED__ (Manila time) &middot; __TOTAL__ items tracked</p>
+<header class="top"><div class="wrap hd">
+  <div class="brand">
+    <div class="mark" aria-hidden="true">N</div>
+    <div><h1>NEXUS<span class="by">by GIA</span></h1><p>Government and Industry Affairs &middot; updates 7:00 AM and 3:00 PM Manila time</p></div>
+  </div>
+  <div class="hr"><span><span class="dot"></span><span id="upd"></span></span><button class="ghost" id="theme" type="button">Dark mode</button></div>
 </div></header>
+<div class="stale" id="stale" role="status" hidden><div class="wrap">This page may be out of date. The last update was more than 18 hours ago, so check again after the next refresh.</div></div>
+<div class="stats"><div class="st"><small>Headlines tracked</small><b id="tot">0</b></div><div class="st"><small>New in last 24 hours</small><b class="red" id="nwc">0</b></div><div class="st"><small>Next update</small><b class="sm" id="nxt"></b></div></div>
 <main class="wrap">
-  <div class="tools"><input id="q" class="search" type="search" placeholder="Search headlines or sources..."></div>
-  <nav class="chips">__NAV__</nav>
-  __SECTIONS__
+  <h2 class="sec">What's new since the last update</h2>
+  <div class="nwg" id="newgrid"></div>
+  <div class="sticky">
+    <div class="bar"><input class="q" id="q" type="search" placeholder="Search headlines or sources... (press / to focus)" aria-label="Search headlines or sources"><button class="cp" id="cp" type="button">Copy brief</button></div>
+    <div class="chips" id="chips"></div>
+  </div>
+  <div id="list"></div>
+  <div id="quiet"></div>
+  <p class="none" id="none" hidden>No matching headlines. Try another topic or search term.</p>
 </main>
-<footer class="wrap">Headlines are collected automatically from Philippine news sources via Google News and link to the original publishers.</footer>
+<footer><div class="wrap">Headlines are collected automatically from Philippine news sources and link to the original publishers.</div></footer>
+<script type="application/json" id="data">__DATA__</script>
 <script>
-  document.getElementById('q').addEventListener('input', function () {
-    var v = this.value.toLowerCase();
-    document.querySelectorAll('.card').forEach(function (c) {
-      c.style.display = c.textContent.toLowerCase().includes(v) ? '' : 'none';
+(function () {
+  var D = JSON.parse(document.getElementById('data').textContent);
+  var TZ = 'Asia/Manila', HOUR = 3600000, DAY = 86400000, NOW = Date.now();
+  function $(id) { return document.getElementById(id); }
+  function el(tag, cls, txt) { var e = document.createElement(tag); if (cls) e.className = cls; if (txt != null) e.textContent = txt; return e; }
+  function safe(u) { return /^https?:\/\//i.test(u) ? u : '#'; }
+  var fKey = new Intl.DateTimeFormat('en-CA', { timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit' });
+  var fDate = new Intl.DateTimeFormat('en-US', { timeZone: TZ, month: 'short', day: 'numeric', year: 'numeric' });
+  var fShort = new Intl.DateTimeFormat('en-US', { timeZone: TZ, month: 'short', day: 'numeric' });
+  var fFull = new Intl.DateTimeFormat('en-US', { timeZone: TZ, month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' });
+  function rel(ms) {
+    var d = NOW - ms;
+    if (d < HOUR) return Math.max(1, Math.round(d / 60000)) + 'm ago';
+    if (d < DAY) return Math.floor(d / HOUR) + 'h ago';
+    return Math.floor(d / DAY) + 'd ago';
+  }
+  function label(ms) {
+    var k = fKey.format(ms);
+    if (k === fKey.format(NOW)) return 'Today';
+    if (k === fKey.format(NOW - DAY)) return 'Yesterday';
+    return (NOW - ms) < 7 * DAY ? 'Earlier this week' : 'Earlier';
+  }
+
+  var items = D.items.slice().sort(function (a, b) { return (b.ts || 0) - (a.ts || 0); });
+  var counts = {};
+  items.forEach(function (i) { counts[i.topic] = (counts[i.topic] || 0) + 1; });
+  var fresh = items.filter(function (i) { return i.ts && NOW - i.ts < DAY; });
+  var topic = 'all', query = '', visible = [];
+
+  try {
+    var p = new URLSearchParams(location.hash.slice(1));
+    var t0 = p.get('t');
+    if (t0 && D.topics.some(function (x) { return x.name === t0; })) topic = t0;
+    query = (p.get('q') || '').trim();
+  } catch (e) {}
+  $('q').value = query;
+
+  $('upd').textContent = 'Updated ' + fFull.format(D.built) + ' Manila';
+  if (NOW - D.built > 18 * HOUR) $('stale').hidden = false;
+  $('tot').textContent = items.length;
+  $('nwc').textContent = fresh.length;
+  var m = new Date(NOW + 8 * HOUR), hr = m.getUTCHours() + m.getUTCMinutes() / 60;
+  $('nxt').textContent = hr < 7 ? 'Today 7:00 AM' : hr < 15 ? 'Today 3:00 PM' : 'Tomorrow 7:00 AM';
+
+  var ng = $('newgrid');
+  if (!fresh.length) { ng.appendChild(el('p', 'muted', 'No new stories in the last 24 hours.')); }
+  fresh.slice(0, 3).forEach(function (i) {
+    var a = el('a', 'nc'); a.href = safe(i.link); a.target = '_blank'; a.rel = 'noopener';
+    a.appendChild(el('span', null, i.topic + ' \u00b7 ' + rel(i.ts)));
+    a.appendChild(el('p', null, i.title));
+    ng.appendChild(a);
+  });
+
+  var chipsEl = $('chips'), btns = [];
+  function addChip(name, count) {
+    var b = el('button', 'chip'); b.type = 'button'; b.setAttribute('data-t', name);
+    b.appendChild(document.createTextNode(name === 'all' ? 'All' : name));
+    b.appendChild(el('i', null, String(count)));
+    b.addEventListener('click', function () { topic = name; apply(); });
+    chipsEl.appendChild(b); btns.push(b);
+  }
+  addChip('all', items.length);
+  var prev = null;
+  D.topics.forEach(function (t) {
+    if (t.tier !== prev) { chipsEl.appendChild(el('span', 'sep')); prev = t.tier; }
+    addChip(t.name, counts[t.name] || 0);
+  });
+
+  function card(i) {
+    var c = el('article', 'cd'), row = el('div', 'row');
+    row.appendChild(el('span', 'tag', i.topic));
+    if (i.ts && NOW - i.ts < DAY) row.appendChild(el('span', 'nw', 'New'));
+    c.appendChild(row);
+    var a = el('a', 'ttl', i.title); a.href = safe(i.link); a.target = '_blank'; a.rel = 'noopener';
+    c.appendChild(a);
+    var mt = el('div', 'mt');
+    if (i.source) { mt.appendChild(el('b', null, i.source)); mt.appendChild(document.createTextNode(' \u00b7 ')); }
+    var s = el('span', null, i.ts ? rel(i.ts) : ''); if (i.ts) s.title = fFull.format(i.ts) + ' Manila';
+    mt.appendChild(s); c.appendChild(mt);
+    return c;
+  }
+
+  function apply() {
+    var v = query.toLowerCase();
+    btns.forEach(function (b) {
+      var on = b.getAttribute('data-t') === topic;
+      b.classList.toggle('on', on); b.setAttribute('aria-pressed', on ? 'true' : 'false');
+    });
+    visible = items.filter(function (i) {
+      return (topic === 'all' || i.topic === topic) && (i.title + ' ' + i.source + ' ' + i.topic).toLowerCase().indexOf(v) > -1;
+    });
+    var list = $('list'); list.textContent = '';
+    var order = ['Today', 'Yesterday', 'Earlier this week', 'Earlier'], groups = {};
+    visible.forEach(function (i) { var l = i.ts ? label(i.ts) : 'Earlier'; (groups[l] = groups[l] || []).push(i); });
+    order.forEach(function (l) {
+      if (!groups[l]) return;
+      var s = el('section'); s.appendChild(el('h2', 'dh', l));
+      groups[l].forEach(function (i) { s.appendChild(card(i)); });
+      list.appendChild(s);
+    });
+    var qEl = $('quiet'); qEl.textContent = '';
+    var quiet = v ? [] : D.topics.filter(function (t) { return !counts[t.name] && (topic === 'all' || topic === t.name); });
+    if (quiet.length) {
+      qEl.appendChild(el('h2', 'dh', 'Quiet topics'));
+      quiet.forEach(function (t) {
+        var r = el('div', 'qt'); r.appendChild(el('span', 'tag', t.name));
+        var msg = 'No matching local news in the last ' + t.window + ' days.';
+        msg += (t.last && t.last.ts) ? ' Last item: ' + fShort.format(t.last.ts) + '.' : ' No earlier item on record.';
+        r.appendChild(el('span', null, msg)); qEl.appendChild(r);
+      });
+    }
+    $('none').hidden = !!(visible.length || quiet.length);
+    try {
+      var sp = new URLSearchParams();
+      if (topic !== 'all') sp.set('t', topic);
+      if (query) sp.set('q', query);
+      var h = sp.toString();
+      history.replaceState(null, '', h ? '#' + h : location.pathname + location.search);
+    } catch (e) {}
+  }
+
+  $('q').addEventListener('input', function () { query = this.value.trim(); apply(); });
+  document.addEventListener('keydown', function (e) {
+    var tg = (document.activeElement && document.activeElement.tagName) || '';
+    if (e.key === '/' && tg !== 'INPUT' && tg !== 'TEXTAREA') { e.preventDefault(); $('q').focus(); }
+  });
+
+  function copyText(txt, cb) {
+    function fallback() {
+      try {
+        var ta = document.createElement('textarea'); ta.value = txt; ta.style.position = 'fixed'; ta.style.opacity = '0';
+        document.body.appendChild(ta); ta.select(); var ok = document.execCommand('copy'); document.body.removeChild(ta); cb(ok);
+      } catch (e) { cb(false); }
+    }
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(txt).then(function () { cb(true); }, fallback);
+    } else { fallback(); }
+  }
+  $('cp').addEventListener('click', function () {
+    var b = this, n = visible.length;
+    if (!n) { b.textContent = 'Nothing to copy'; setTimeout(function () { b.textContent = 'Copy brief'; }, 1800); return; }
+    var lines = visible.map(function (i) {
+      return '[' + i.topic + '] ' + i.title + ' - ' + i.source + (i.ts ? ', ' + fDate.format(i.ts) : '');
+    });
+    var txt = 'NEXUS by GIA brief - ' + fDate.format(NOW) + '\n\n' + lines.join('\n');
+    copyText(txt, function (ok) {
+      b.textContent = ok ? 'Copied ' + n + ' headlines' : 'Copy failed';
+      setTimeout(function () { b.textContent = 'Copy brief'; }, 1800);
     });
   });
+
+  var root = document.documentElement, tb = $('theme');
+  function cur() {
+    var t = root.getAttribute('data-theme'); if (t) return t;
+    return window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  }
+  function setLabel() { tb.textContent = cur() === 'dark' ? 'Light mode' : 'Dark mode'; }
+  try { var st = localStorage.getItem('nexus-theme'); if (st) root.setAttribute('data-theme', st); } catch (e) {}
+  tb.addEventListener('click', function () {
+    var n = cur() === 'dark' ? 'light' : 'dark'; root.setAttribute('data-theme', n);
+    try { localStorage.setItem('nexus-theme', n); } catch (e) {}
+    setLabel();
+  });
+  setLabel();
+  apply();
+})();
 </script>
 </body></html>"""
 
-page = (
-    TEMPLATE.replace("__PAGE_TITLE__", html.escape(PAGE_TITLE))
-    .replace("__HEADING__", html.escape(HEADING))
-    .replace("__VERSION__", html.escape(VERSION))
-    .replace("__SUBTITLE__", html.escape(SUBTITLE))
-    .replace("__UPDATED__", f"{now:%B %d, %Y %I:%M %p}")
-    .replace("__TOTAL__", str(total))
-    .replace("__NAV__", "".join(nav))
-    .replace("__SECTIONS__", "".join(sections))
-)
+page = TEMPLATE.replace("__TITLE__", html.escape(PAGE_TITLE)).replace("__DATA__", data_json)
 
 os.makedirs("docs", exist_ok=True)
 with open("docs/index.html", "w", encoding="utf-8") as f:
