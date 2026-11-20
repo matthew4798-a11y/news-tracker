@@ -13,63 +13,206 @@ HEADING = "GIA Automated News Tracker"
 VERSION = "v1.0"
 SUBTITLE = "Updates every 7:00 AM and 3:00 PM Manila time"
 
-WINDOW = "7d"            # how far back to search, e.g. 1d, 3d, 7d
+# ---------------------------------------------------------------
+# SETTINGS
+# ---------------------------------------------------------------
+LOCAL_ONLY = True        # True = search only Philippine news sites
+STRICT_FILTER = True     # True = drop headlines that don't match the topic rules
 MAX_PER_SECTION = 10     # newest items shown per topic
-BLOCKED_SOURCES = []     # e.g. ["Facebook"] to hide noisy sources
+BLOCKED_SOURCES = []     # e.g. ["Facebook"] to hide a source
 
-TOPICS = {
-    "CARS": [
-        "Comprehensive Automotive Resurgence Strategy",
-        "CARS program Philippines",
-    ],
-    "RACE": [
-        "RACE program Philippines DTI",
-        "Philippines automotive RACE incentive",
-    ],
-    "EVIS": [
-        "EVIS Philippines",
-        "Electric Vehicle Incentive Strategy Philippines",
-    ],
-    "Taxes and tariffs": [
-        "Philippines automotive excise tax",
-        "Philippines vehicle tariff",
-    ],
-    "EV incentives": [
-        "Philippines EV incentives",
-    ],
-    "Biofuels": [
-        "Biofuels Philippines",
-    ],
-    "Hydrogen": [
-        "Hydrogen Philippines",
-    ],
-    "Carbon trading": [
-        "Carbon trading Philippines",
-    ],
-}
+LOCAL_SITES = [
+    "inquirer.net", "philstar.com", "bworldonline.com", "businessmirror.com.ph",
+    "mb.com.ph", "pna.gov.ph", "manilatimes.net", "pia.gov.ph", "tribune.net.ph",
+    "gmanetwork.com", "rappler.com", "autoindustriya.com", "carguide.ph",
+    "topgear.com.ph", "dti.gov.ph", "boi.gov.ph",
+]
+
+PH_CONTEXT = (
+    r"philippine|filipino|\bphl\b|\bph\b|manila|\bdti\b|\bboi\b|\bdof\b|\bdoe\b"
+    r"|bureau of customs|tariff commission|\blto\b|marcos|\bneda\b|jpepa"
+)
+VEHICLE = (
+    r"\b(autos?|automotive|automobiles?|cars?|vehicles?|evs?|electric vehicles?"
+    r"|motor vehicles?|carmakers?|automakers?|cbu|ckd|hybrids?|motorcycles?|auto parts)\b"
+)
+POLICY = (
+    r"tariffs?|\btax(es)?\b|dut(y|ies)|excise|jpepa|atiga|asean|rcep|\bfta\b"
+    r"|free trade|trade (deal|pact|agreement)|customs|import|safeguard"
+)
+
+# ---------------------------------------------------------------
+# TOPICS
+#   queries : what we ask Google News
+#   window  : how far back to look (days)
+#   require : every pattern here must appear in the headline
+#   exclude : if any pattern appears in the headline, drop it
+# ---------------------------------------------------------------
+TOPICS = [
+    {
+        "name": "CARS",
+        "full": "Comprehensive Automotive Resurgence Strategy",
+        "window": "30d",
+        "queries": [
+            '"Comprehensive Automotive Resurgence Strategy"',
+            '"CARS program" Philippines automotive',
+            '"CARS" DTI BOI automotive incentive',
+        ],
+        "require": [
+            r"comprehensive automotive resurgence"
+            r"|\bcars\b.{0,40}\b(program|programme|strategy|scheme|incentives?|dti|boi"
+            r"|automotive|carmakers?|assemblers?|manufactur\w*)"
+        ],
+        "exclude": [],
+    },
+    {
+        "name": "EVIS",
+        "full": "Electric Vehicle Incentive Strategy",
+        "window": "30d",
+        "queries": [
+            '"Electric Vehicle Incentive Strategy"',
+            '"EVIS" Philippines electric vehicle',
+            'Philippines EV incentives DTI BOI',
+        ],
+        "require": [
+            r"electric vehicle incentive strategy|\bevis\b"
+            r"|\b(ev|evs|electric vehicles?)\b.{0,30}\bincentives?\b"
+            r"|\bincentives?\b.{0,30}\b(ev|evs|electric vehicles?)\b"
+        ],
+        "exclude": [
+            r"\bu\.s\.|united states|american|canada|\buk\b|britain|europe\w*"
+            r"|\bindia\b|australia|new zealand|california|tesla"
+        ],
+    },
+    {
+        "name": "RACE",
+        "full": "Revitalizing the Automotive Industry for Competitiveness Enhancement",
+        "window": "30d",
+        "queries": [
+            '"Revitalizing the Automotive Industry for Competitiveness Enhancement"',
+            '"RACE program" Philippines automotive',
+            '"RACE" DTI BOI automotive incentive',
+        ],
+        "require": [
+            r"revitalizing the automotive industry"
+            r"|\brace (program|programme|incentives?|scheme)\b"
+            r"|\brace\b.{0,30}\b(dti|boi)\b"
+        ],
+        "exclude": [
+            r"horse|marathon|election|presidential|mayoral|senate|motogp|formula"
+            r"|\bf1\b|nascar|grand prix|racing|fun run|\brace to\b"
+        ],
+    },
+    {
+        "name": "Automotive tariffs and taxes",
+        "full": "Vehicle tariffs, excise taxes, JPEPA, ASEAN and other trade agreements",
+        "window": "14d",
+        "queries": [
+            "Philippines automotive tariff",
+            "Philippines vehicle excise tax",
+            "JPEPA automotive Philippines Japan",
+            "ASEAN ATIGA automotive tariff Philippines",
+            "RCEP automotive Philippines tariff",
+            "Philippines electric vehicle tariff executive order",
+            "Philippines vehicle imports duty Bureau of Customs",
+        ],
+        "require": [VEHICLE, POLICY, PH_CONTEXT + r"|asean|atiga|rcep"],
+        "exclude": [r"canada|thailand|\buk\b|britain"],
+    },
+    {
+        "name": "Hydrogen",
+        "full": "Hydrogen and clean fuels in the Philippines",
+        "window": "7d",
+        "queries": [
+            "hydrogen Philippines energy DOE",
+            "green hydrogen Philippines",
+        ],
+        "require": [r"hydrogen"],
+        "exclude": [],
+    },
+    {
+        "name": "Biofuels",
+        "full": "Biodiesel, bioethanol and blending mandates",
+        "window": "7d",
+        "queries": [
+            "biofuels Philippines",
+            "biodiesel Philippines coconut methyl ester",
+            "bioethanol Philippines DOE blend",
+        ],
+        "require": [
+            r"bio-?fuels?|bio-?diesel|bio-?ethanol|ethanol|coconut methyl ester"
+            r"|\bcme\b|sustainable aviation fuel"
+        ],
+        "exclude": [],
+    },
+    {
+        "name": "Carbon trading",
+        "full": "Carbon markets, credits and carbon pricing",
+        "window": "7d",
+        "queries": [
+            "carbon market Philippines",
+            "carbon trading Philippines",
+            "carbon credits Philippines DENR",
+        ],
+        "require": [
+            r"carbon (market|markets|trading|credits?|tax|pricing|offsets?|emissions?)"
+            r"|emissions? trading|\bets\b|cap-and-trade"
+        ],
+        "exclude": [],
+    },
+]
 
 
-def fetch(query):
-    url = (
+def build_url(query, window):
+    q = query
+    if LOCAL_ONLY:
+        sites = " OR ".join(f"site:{d}" for d in LOCAL_SITES)
+        q = f"{query} ({sites})"
+    q = f"{q} when:{window}"
+    return (
         "https://news.google.com/rss/search?q="
-        f"{quote(query)}+when:{WINDOW}&hl=en-PH&gl=PH&ceid=PH:en"
+        f"{quote(q)}&hl=en-PH&gl=PH&ceid=PH:en"
     )
-    return feedparser.parse(url).entries
+
+
+def fetch(query, window):
+    return feedparser.parse(build_url(query, window)).entries
 
 
 def parse_entry(e):
-    title = e.get("title", "").strip()
-    source = (e.get("source") or {}).get("title", "").strip()
+    title = (e.get("title") or "").strip()
+    src = e.get("source") or {}
+    source = (src.get("title") or "").strip()
+    href = (src.get("href") or "").strip()
     if source and title.endswith(" - " + source):
         title = title[: -(len(source) + 3)]
     elif not source and " - " in title:
         title, source = title.rsplit(" - ", 1)
+    text = title.lower()
     if len(title) > 150:
         title = title[:147].rstrip() + "..."
     dt = None
     if e.get("published_parsed"):
-        dt = datetime(*e.published_parsed[:6], tzinfo=timezone.utc).astimezone(MANILA)
-    return {"title": title, "source": source, "link": e.get("link", ""), "dt": dt}
+        dt = datetime(*e["published_parsed"][:6], tzinfo=timezone.utc).astimezone(MANILA)
+    return {
+        "title": title, "text": text, "source": source,
+        "href": href, "link": e.get("link", ""), "dt": dt,
+    }
+
+
+def is_local(item):
+    return any(d in item["href"] for d in LOCAL_SITES)
+
+
+def is_relevant(item, topic):
+    if not STRICT_FILTER:
+        return True
+    text = item["text"]
+    if not is_local(item) and not re.search(PH_CONTEXT, text):
+        return False
+    if any(re.search(p, text) for p in topic["exclude"]):
+        return False
+    return all(re.search(p, text) for p in topic["require"])
 
 
 def slugify(text):
@@ -77,25 +220,24 @@ def slugify(text):
 
 
 now = datetime.now(MANILA)
-seen_links, seen_titles = set(), set()
 nav, sections = [], []
 total = 0
 
-for heading, queries in TOPICS.items():
-    items = []
-    for q in queries:
-        for e in fetch(q):
+for topic in TOPICS:
+    items, seen_links, seen_titles = [], set(), set()
+    for q in topic["queries"]:
+        for e in fetch(q, topic["window"]):
             item = parse_entry(e)
-            key = item["title"].lower()
             if (
                 not item["link"]
                 or item["link"] in seen_links
-                or key in seen_titles
+                or item["text"] in seen_titles
                 or item["source"] in BLOCKED_SOURCES
+                or not is_relevant(item, topic)
             ):
                 continue
             seen_links.add(item["link"])
-            seen_titles.add(key)
+            seen_titles.add(item["text"])
             items.append(item)
 
     items.sort(key=lambda i: i["dt"] or datetime.min.replace(tzinfo=MANILA), reverse=True)
@@ -118,15 +260,15 @@ for heading, queries in TOPICS.items():
             f'<div class="meta">{"".join(meta)}</div></li>'
         )
     if not cards:
-        cards = ['<li class="empty">No items found in the last ' + WINDOW + ".</li>"]
+        days = topic["window"].rstrip("d")
+        cards = [f'<li class="empty">No matching local news in the last {days} days.</li>']
 
-    slug = slugify(heading)
-    nav.append(
-        f'<a href="#{slug}">{html.escape(heading)} <span>{len(items)}</span></a>'
-    )
+    slug = slugify(topic["name"])
+    nav.append(f'<a href="#{slug}">{html.escape(topic["name"])} <span>{len(items)}</span></a>')
     sections.append(
-        f'<section id="{slug}"><h2>{html.escape(heading)}'
+        f'<section id="{slug}"><h2>{html.escape(topic["name"])}'
         f'<span class="count">{len(items)}</span></h2>'
+        f'<p class="desc">{html.escape(topic["full"])}</p>'
         f'<ul>{"".join(cards)}</ul></section>'
     )
 
@@ -168,7 +310,8 @@ TEMPLATE = """<!doctype html>
              padding: .35rem .75rem; border-radius: 999px; font-weight: 500; }
   .chips a span { opacity: .7; margin-left: .25rem; }
   section { margin-top: 1.75rem; scroll-margin-top: 1rem; }
-  h2 { font-size: 1.1rem; margin: 0 0 .6rem; display: flex; align-items: center; gap: .5rem; }
+  h2 { font-size: 1.1rem; margin: 0; display: flex; align-items: center; gap: .5rem; }
+  .desc { margin: .15rem 0 .6rem; font-size: .85rem; color: var(--muted); }
   .count { font-size: .75rem; font-weight: 600; color: var(--muted); background: var(--card);
            border: 1px solid var(--line); border-radius: 999px; padding: .05rem .5rem; }
   ul { list-style: none; margin: 0; padding: 0; display: grid; gap: .6rem; }
@@ -196,7 +339,7 @@ TEMPLATE = """<!doctype html>
   <nav class="chips">__NAV__</nav>
   __SECTIONS__
 </main>
-<footer class="wrap">Headlines are collected automatically from Google News and link to the original publishers.</footer>
+<footer class="wrap">Headlines are collected automatically from Philippine news sources via Google News and link to the original publishers.</footer>
 <script>
   document.getElementById('q').addEventListener('input', function () {
     var v = this.value.toLowerCase();
