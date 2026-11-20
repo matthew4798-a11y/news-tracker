@@ -3,11 +3,15 @@ import html
 import json
 import os
 import re
+import socket
+import sys
+import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from urllib.parse import quote
 
 MANILA = ZoneInfo("Asia/Manila")
+socket.setdefaulttimeout(20)
 
 PAGE_TITLE = "NEXUS by GIA"
 STATE_FILE = "state.json"   # remembers the last story seen per topic
@@ -15,16 +19,19 @@ STATE_FILE = "state.json"   # remembers the last story seen per topic
 # ---------------------------------------------------------------
 # SETTINGS
 # ---------------------------------------------------------------
-LOCAL_ONLY = True        # True = search only Philippine news sites
-STRICT_FILTER = True     # True = drop headlines that don't match the topic rules
-MAX_PER_SECTION = 10     # newest items kept per topic
-BLOCKED_SOURCES = []     # e.g. ["Facebook"] to hide a source
+LOCAL_ONLY = True          # True = search only Philippine news sites
+STRICT_FILTER = True       # True = drop headlines that don't match the topic rules
+MAX_PER_SECTION = 10       # newest items kept per topic
+BLOCKED_SOURCES = []       # e.g. ["Facebook"] to hide a source
+REFRESH_MINUTES = 30       # shown on the page; keep in step with the cron line in update-digest.yml
+STALE_AFTER_HOURS = 3      # show the "out of date" banner after this long without a refresh
+REQUEST_DELAY = 0.25       # seconds between Google News requests (keeps us polite)
 
 LOCAL_SITES = [
     "inquirer.net", "philstar.com", "bworldonline.com", "businessmirror.com.ph",
     "mb.com.ph", "pna.gov.ph", "manilatimes.net", "pia.gov.ph", "tribune.net.ph",
     "gmanetwork.com", "rappler.com", "autoindustriya.com", "carguide.ph",
-    "topgear.com.ph", "dti.gov.ph", "boi.gov.ph",
+    "topgear.com.ph", "dti.gov.ph", "boi.gov.ph", "customs.gov.ph", "lto.gov.ph",
 ]
 
 PH_CONTEXT = (
@@ -42,11 +49,12 @@ POLICY = (
 
 # ---------------------------------------------------------------
 # TOPICS
-#   tier    : "core" or "energy" (controls grouping in the filter bar)
+#   tier    : groups the filter chips ("core", "agencies", "company", "energy")
 #   queries : what we ask Google News
 #   window  : how far back to look (days)
 #   require : every pattern here must appear in the headline
 #   exclude : if any pattern appears in the headline, drop it
+# A story that fits several topics is shown once, with several tags.
 # ---------------------------------------------------------------
 TOPICS = [
     {
@@ -120,6 +128,61 @@ TOPICS = [
         "exclude": [r"canada|thailand|\buk\b|britain"],
     },
     {
+        "name": "BOI", "tier": "agencies",
+        "full": "Board of Investments news, approvals and incentives",
+        "window": "7d",
+        "queries": [
+            '"Board of Investments" Philippines',
+            "BOI approves investments Philippines",
+            "BOI incentives registered projects Philippines",
+        ],
+        "require": [r"board of investments|\bboi\b"],
+        "exclude": [],
+    },
+    {
+        "name": "BOC", "tier": "agencies",
+        "full": "Bureau of Customs news, orders and enforcement",
+        "window": "7d",
+        "queries": [
+            '"Bureau of Customs" Philippines',
+            "BOC customs Philippines import",
+            "Bureau of Customs vehicles imported cars",
+        ],
+        "require": [r"bureau of customs|\bboc\b|\bcustoms\b"],
+        "exclude": [
+            r"thai customs|chinese customs|u\.s\. customs|\bus customs\b|indian customs"
+            r"|canada border|\bcbp\b|hmrc"
+        ],
+    },
+    {
+        "name": "LTO and road safety", "tier": "agencies",
+        "full": "Land Transportation Office news and road safety",
+        "window": "7d",
+        "queries": [
+            '"Land Transportation Office" road safety',
+            "LTO road safety Philippines",
+            "LTO driver's license registration plates Philippines",
+            '"road safety" Philippines',
+        ],
+        "require": [r"\blto\b|land transportation office|road safety"],
+        "exclude": [],
+    },
+    {
+        "name": "Toyota Philippines", "tier": "company",
+        "full": "Toyota Motor Philippines and Toyota news in local media",
+        "window": "14d",
+        "queries": [
+            '"Toyota Motor Philippines"',
+            '"Toyota Philippines"',
+            "Toyota Philippines DTI BOI automotive",
+        ],
+        "require": [r"toyota|\btmpc\b"],
+        "exclude": [
+            r"\bu\.s\.|united states|nhtsa|north america|\beurope\w*|\bindia\b"
+            r"|australia|\bcanada\b"
+        ],
+    },
+    {
         "name": "Hydrogen", "tier": "energy",
         "full": "Hydrogen and clean fuels in the Philippines",
         "window": "7d",
@@ -162,6 +225,8 @@ TOPICS = [
     },
 ]
 
+STATS = {"queries": 0, "failed": 0}
+
 
 def build_url(query, window):
     q = query
@@ -176,7 +241,21 @@ def build_url(query, window):
 
 
 def fetch(query, window):
-    return feedparser.parse(build_url(query, window)).entries
+    if STATS["queries"]:
+        time.sleep(REQUEST_DELAY)
+    STATS["queries"] += 1
+    try:
+        feed = feedparser.parse(build_url(query, window))
+    except Exception as exc:
+        STATS["failed"] += 1
+        print(f"WARN: request failed for {query!r}: {exc}")
+        return []
+    status = getattr(feed, "status", 200)
+    if status >= 400 or (getattr(feed, "bozo", 0) and not feed.entries):
+        STATS["failed"] += 1
+        print(f"WARN: feed error (status {status}) for {query!r}")
+        return []
+    return feed.entries
 
 
 def parse_entry(e):
@@ -226,10 +305,12 @@ def load_state():
 
 now = datetime.now(MANILA)
 state = load_state()
-all_items, topic_meta = [], []
+merged = {}      # link -> story (a story can carry several topic tags)
+by_title = {}    # headline -> link, so the same story from two sources merges
+topic_meta = []
 
 for topic in TOPICS:
-    items, seen_links, seen_titles = [], set(), set()
+    found, seen_links, seen_titles = [], set(), set()
     for q in topic["queries"]:
         for e in fetch(q, topic["window"]):
             item = parse_entry(e)
@@ -243,32 +324,48 @@ for topic in TOPICS:
                 continue
             seen_links.add(item["link"])
             seen_titles.add(item["text"])
-            items.append(item)
+            found.append(item)
 
-    items.sort(key=lambda i: i["ts"] or 0, reverse=True)
-    items = items[:MAX_PER_SECTION]
+    found.sort(key=lambda i: i["ts"] or 0, reverse=True)
+    found = found[:MAX_PER_SECTION]
 
-    if items and items[0]["ts"]:
-        state[topic["name"]] = {"ts": items[0]["ts"], "title": items[0]["title"]}
+    if found and found[0]["ts"]:
+        state[topic["name"]] = {"ts": found[0]["ts"], "title": found[0]["title"]}
 
-    for i in items:
-        all_items.append({
-            "topic": topic["name"], "title": i["title"], "source": i["source"],
-            "link": i["link"], "ts": i["ts"],
-        })
+    for item in found:
+        key = by_title.get(item["text"], item["link"])
+        if key in merged:
+            if topic["name"] not in merged[key]["topics"]:
+                merged[key]["topics"].append(topic["name"])
+        else:
+            merged[item["link"]] = {
+                "topics": [topic["name"]], "title": item["title"],
+                "source": item["source"], "link": item["link"], "ts": item["ts"],
+            }
+            by_title[item["text"]] = item["link"]
+
     topic_meta.append({
         "name": topic["name"], "full": topic["full"], "tier": topic["tier"],
         "window": int(topic["window"].rstrip("d")),
         "last": state.get(topic["name"]),
     })
 
+if STATS["queries"] and STATS["failed"] == STATS["queries"]:
+    print("ERROR: every feed request failed, so the existing page was left untouched.")
+    sys.exit(1)
+if STATS["failed"]:
+    print(f"WARN: {STATS['failed']} of {STATS['queries']} requests failed this run.")
+
 with open(STATE_FILE, "w", encoding="utf-8") as f:
     json.dump(state, f, ensure_ascii=False, indent=2)
 
+stories = sorted(merged.values(), key=lambda s: s["ts"] or 0, reverse=True)
 data = {
     "built": int(now.timestamp() * 1000),
+    "refresh": REFRESH_MINUTES,
+    "stale": STALE_AFTER_HOURS,
     "topics": topic_meta,
-    "items": all_items,
+    "items": stories,
 }
 data_json = json.dumps(data, ensure_ascii=False).replace("<", "\\u003c")
 
@@ -320,6 +417,9 @@ TEMPLATE = r"""<!doctype html>
   .stale { background:var(--warnbg); color:var(--warntx); border-bottom:1px solid var(--warnln);
            padding:.65rem 0; font-size:.9rem; }
   .stale[hidden] { display:none; }
+  .newver { background:var(--tx); color:var(--bg); padding:.5rem 0; font-size:.9rem; }
+  .newver[hidden] { display:none; }
+  .nv { background:var(--rd); color:#fff; border:0; border-radius:999px; padding:.3rem .9rem; margin-left:.5rem; min-height:32px; }
 
   .stats { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:1px;
            background:var(--ln); border-bottom:1px solid var(--ln); }
@@ -358,7 +458,7 @@ TEMPLATE = r"""<!doctype html>
   .cd { background:var(--card); border:1px solid var(--ln); border-left:3px solid var(--rd);
         padding:.65rem .9rem; margin-bottom:.5rem; transition:transform .12s; }
   .cd:hover { transform:translateX(3px); border-color:var(--tx); border-left-color:var(--rd); }
-  .row { display:flex; align-items:center; gap:.5rem; }
+  .row { display:flex; align-items:center; gap:.4rem; flex-wrap:wrap; }
   .tag { font-size:.7rem; background:var(--tagbg); color:var(--tagtx); padding:.05rem .6rem; border-radius:999px; }
   .nw { font-size:.7rem; background:var(--rd); color:#fff; padding:.05rem .6rem; border-radius:999px; font-weight:600; }
   .ttl { display:block; margin-top:.3rem; font-size:.95rem; font-weight:600; line-height:1.45; color:var(--tx); text-decoration:none; }
@@ -374,7 +474,7 @@ TEMPLATE = r"""<!doctype html>
   @media (max-width:600px) { .stats { grid-template-columns:1fr 1fr 1fr; } .st { padding:.6rem .6rem; } .st b { font-size:1.15rem; } }
   @media (prefers-reduced-motion: reduce) { .cd { transition:none; } .cd:hover { transform:none; } }
   @media print {
-    .ghost, .sticky, .cp, .stale, .stats { display:none !important; }
+    .ghost, .sticky, .cp, .stale, .newver, .stats { display:none !important; }
     body { background:#fff; color:#000; } .top, footer { background:#fff; color:#000; border-color:#000; }
     h1 .by, .brand p { color:#333; } .cd { break-inside:avoid; }
   }
@@ -383,14 +483,15 @@ TEMPLATE = r"""<!doctype html>
 <header class="top"><div class="wrap hd">
   <div class="brand">
     <div class="mark" aria-hidden="true">N</div>
-    <div><h1>NEXUS<span class="by">by GIA</span></h1><p>Government and Industry Affairs &middot; updates 7:00 AM and 3:00 PM Manila time</p></div>
+    <div><h1>NEXUS<span class="by">by GIA</span></h1><p>Government and Industry Affairs &middot; monitoring 24/7 &middot; refreshes about every __REFRESH__ minutes</p></div>
   </div>
   <div class="hr"><span><span class="dot"></span><span id="upd"></span></span><button class="ghost" id="theme" type="button">Dark mode</button></div>
 </div></header>
-<div class="stale" id="stale" role="status" hidden><div class="wrap">This page may be out of date. The last update was more than 18 hours ago, so check again after the next refresh.</div></div>
-<div class="stats"><div class="st"><small>Headlines tracked</small><b id="tot">0</b></div><div class="st"><small>New in last 24 hours</small><b class="red" id="nwc">0</b></div><div class="st"><small>Next update</small><b class="sm" id="nxt"></b></div></div>
+<div class="stale" id="stale" role="status" hidden><div class="wrap" id="staletxt"></div></div>
+<div class="newver" id="newver" role="status" hidden><div class="wrap">New headlines are available.<button class="nv" id="reload" type="button">Refresh now</button></div></div>
+<div class="stats"><div class="st"><small>Headlines tracked</small><b id="tot">0</b></div><div class="st"><small>New in last 24 hours</small><b class="red" id="nwc">0</b></div><div class="st"><small>Last refreshed</small><b class="sm" id="lastref"></b></div></div>
 <main class="wrap">
-  <h2 class="sec">What's new since the last update</h2>
+  <h2 class="sec">Latest in the last 24 hours</h2>
   <div class="nwg" id="newgrid"></div>
   <div class="sticky">
     <div class="bar"><input class="q" id="q" type="search" placeholder="Search headlines or sources... (press / to focus)" aria-label="Search headlines or sources"><button class="cp" id="cp" type="button">Copy brief</button></div>
@@ -428,9 +529,8 @@ TEMPLATE = r"""<!doctype html>
 
   var items = D.items.slice().sort(function (a, b) { return (b.ts || 0) - (a.ts || 0); });
   var counts = {};
-  items.forEach(function (i) { counts[i.topic] = (counts[i.topic] || 0) + 1; });
-  var fresh = items.filter(function (i) { return i.ts && NOW - i.ts < DAY; });
-  var topic = 'all', query = '', visible = [];
+  items.forEach(function (i) { i.topics.forEach(function (t) { counts[t] = (counts[t] || 0) + 1; }); });
+  var fresh = [], topic = 'all', query = '', visible = [];
 
   try {
     var p = new URLSearchParams(location.hash.slice(1));
@@ -440,21 +540,24 @@ TEMPLATE = r"""<!doctype html>
   } catch (e) {}
   $('q').value = query;
 
-  $('upd').textContent = 'Updated ' + fFull.format(D.built) + ' Manila';
-  if (NOW - D.built > 18 * HOUR) $('stale').hidden = false;
-  $('tot').textContent = items.length;
-  $('nwc').textContent = fresh.length;
-  var m = new Date(NOW + 8 * HOUR), hr = m.getUTCHours() + m.getUTCMinutes() / 60;
-  $('nxt').textContent = hr < 7 ? 'Today 7:00 AM' : hr < 15 ? 'Today 3:00 PM' : 'Tomorrow 7:00 AM';
-
-  var ng = $('newgrid');
-  if (!fresh.length) { ng.appendChild(el('p', 'muted', 'No new stories in the last 24 hours.')); }
-  fresh.slice(0, 3).forEach(function (i) {
-    var a = el('a', 'nc'); a.href = safe(i.link); a.target = '_blank'; a.rel = 'noopener';
-    a.appendChild(el('span', null, i.topic + ' \u00b7 ' + rel(i.ts)));
-    a.appendChild(el('p', null, i.title));
-    ng.appendChild(a);
-  });
+  function renderTop() {
+    fresh = items.filter(function (i) { return i.ts && NOW - i.ts < DAY; });
+    $('upd').textContent = 'Updated ' + fFull.format(D.built) + ' Manila';
+    var stale = NOW - D.built > D.stale * HOUR;
+    $('stale').hidden = !stale;
+    if (stale) $('staletxt').textContent = 'This page may be out of date. The last refresh was more than ' + D.stale + ' hours ago, so reload the page or check again shortly.';
+    $('tot').textContent = items.length;
+    $('nwc').textContent = fresh.length;
+    $('lastref').textContent = rel(D.built);
+    var ng = $('newgrid'); ng.textContent = '';
+    if (!fresh.length) { ng.appendChild(el('p', 'muted', 'No new stories in the last 24 hours.')); }
+    fresh.slice(0, 3).forEach(function (i) {
+      var a = el('a', 'nc'); a.href = safe(i.link); a.target = '_blank'; a.rel = 'noopener';
+      a.appendChild(el('span', null, i.topics.join(' + ') + ' \u00b7 ' + rel(i.ts)));
+      a.appendChild(el('p', null, i.title));
+      ng.appendChild(a);
+    });
+  }
 
   var chipsEl = $('chips'), btns = [];
   function addChip(name, count) {
@@ -473,7 +576,7 @@ TEMPLATE = r"""<!doctype html>
 
   function card(i) {
     var c = el('article', 'cd'), row = el('div', 'row');
-    row.appendChild(el('span', 'tag', i.topic));
+    i.topics.forEach(function (t) { row.appendChild(el('span', 'tag', t)); });
     if (i.ts && NOW - i.ts < DAY) row.appendChild(el('span', 'nw', 'New'));
     c.appendChild(row);
     var a = el('a', 'ttl', i.title); a.href = safe(i.link); a.target = '_blank'; a.rel = 'noopener';
@@ -492,7 +595,8 @@ TEMPLATE = r"""<!doctype html>
       b.classList.toggle('on', on); b.setAttribute('aria-pressed', on ? 'true' : 'false');
     });
     visible = items.filter(function (i) {
-      return (topic === 'all' || i.topic === topic) && (i.title + ' ' + i.source + ' ' + i.topic).toLowerCase().indexOf(v) > -1;
+      return (topic === 'all' || i.topics.indexOf(topic) > -1) &&
+        (i.title + ' ' + i.source + ' ' + i.topics.join(' ')).toLowerCase().indexOf(v) > -1;
     });
     var list = $('list'); list.textContent = '';
     var order = ['Today', 'Yesterday', 'Earlier this week', 'Earlier'], groups = {};
@@ -545,7 +649,7 @@ TEMPLATE = r"""<!doctype html>
     var b = this, n = visible.length;
     if (!n) { b.textContent = 'Nothing to copy'; setTimeout(function () { b.textContent = 'Copy brief'; }, 1800); return; }
     var lines = visible.map(function (i) {
-      return '[' + i.topic + '] ' + i.title + ' - ' + i.source + (i.ts ? ', ' + fDate.format(i.ts) : '');
+      return '[' + i.topics.join(', ') + '] ' + i.title + ' - ' + i.source + (i.ts ? ', ' + fDate.format(i.ts) : '');
     });
     var txt = 'NEXUS by GIA brief - ' + fDate.format(NOW) + '\n\n' + lines.join('\n');
     copyText(txt, function (ok) {
@@ -567,12 +671,36 @@ TEMPLATE = r"""<!doctype html>
     setLabel();
   });
   setLabel();
+
+  function tick() { NOW = Date.now(); renderTop(); apply(); }
+  function check() {
+    if (document.hidden || !window.fetch) return;
+    fetch(location.pathname + location.search, { cache: 'no-store' })
+      .then(function (r) { return r.ok ? r.text() : ''; })
+      .then(function (t) {
+        var m = t.match(/<script type="application\/json" id="data">([\s\S]*?)<\/script>/);
+        if (!m) return;
+        var b = JSON.parse(m[1]).built;
+        if (b && b > D.built) $('newver').hidden = false;
+      })
+      .catch(function () {});
+  }
+  $('reload').addEventListener('click', function () { location.reload(); });
+  setInterval(tick, 60000);
+  setInterval(check, 300000);
+  document.addEventListener('visibilitychange', function () { if (!document.hidden) { tick(); check(); } });
+
+  renderTop();
   apply();
 })();
 </script>
 </body></html>"""
 
-page = TEMPLATE.replace("__TITLE__", html.escape(PAGE_TITLE)).replace("__DATA__", data_json)
+page = (
+    TEMPLATE.replace("__TITLE__", html.escape(PAGE_TITLE))
+    .replace("__REFRESH__", str(REFRESH_MINUTES))
+    .replace("__DATA__", data_json)
+)
 
 os.makedirs("docs", exist_ok=True)
 with open("docs/index.html", "w", encoding="utf-8") as f:
