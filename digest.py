@@ -223,6 +223,36 @@ TOPICS = [
         ],
         "exclude": [],
     },
+        {
+        "name": "Euro 5", "tier": "core",
+        "full": "Euro 5 emission standards for vehicles and fuels",
+        "window": "14d",
+        "queries": [
+            "Euro 5 Philippines",
+            "Euro 5 emission standard Philippines vehicles",
+            "Euro 5 fuel standard Philippines DENR DOE",
+        ],
+        "require": [
+            r"euro[\s-]?(5|v)\b|euro 4 to euro 5|emission standards?"
+        ],
+        "exclude": [
+            r"euro 5 (million|billion)|uefa|champions league|world cup|football|soccer|euro ?2028|euro ?2032|euro zone|eurozone|forex|currency"
+        ],
+    },
+    {
+        "name": "MEPS", "tier": "energy",
+        "full": "Minimum Energy Performance Standards",
+        "window": "14d",
+        "queries": [
+            "Minimum Energy Performance Standards Philippines",
+            "MEPS Philippines DOE",
+            "energy efficiency standards Philippines DOE vehicles appliances",
+        ],
+        "require": [
+            r"\bmeps\b|minimum energy performance"
+        ],
+        "exclude": [],
+    },
 ]
 
 STATS = {"queries": 0, "failed": 0}
